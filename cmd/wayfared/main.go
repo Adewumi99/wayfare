@@ -91,6 +91,10 @@ func main() {
 		os.Exit(2)
 	}
 
+	dex.SetLogger(logger)
+	refrate.SetLogger(logger)
+	server.SetLogger(logger)
+
 	engine := &route.Engine{
 		DEX: &dex.Client{HorizonURL: *horizon, Logger: logger},
 		// Two independent providers, each cached, cross-checked for
@@ -110,7 +114,15 @@ func main() {
 	// and the chain it appends to is the same one a hosted instance would
 	// write. Nothing about the measurement differs.
 	if *once {
-		sched := &monitor.Scheduler{Engine: engine, Store: store, Logger: logger}
+		sched := &monitor.Scheduler{
+			Engine: engine,
+			Store:  store,
+			Logger: logger,
+			// The same sweep the server runs: checks run alongside the
+			// measurement and are recorded with it, so scheduled history
+			// and live responses describe the same thing.
+			Checks: &checks.Runner{HorizonURL: *horizon},
+		}
 		if err := sched.RunOnce(ctx); err != nil {
 			logger.Error("sweep failed", "error", err)
 			os.Exit(1)
@@ -126,6 +138,9 @@ func main() {
 			Store:    store,
 			Interval: *schedule,
 			Logger:   logger,
+			// Same sweep as the server (and as -once), so the horizon the
+			// shared checks runner targets matches the engine's.
+			Checks: &checks.Runner{HorizonURL: *horizon},
 		}
 		wg.Add(1)
 		go func() {
@@ -145,7 +160,6 @@ func main() {
 			Timeout:      *timeout,
 			HistoryFirst: *histFirst,
 			Checks:       &checks.Runner{HorizonURL: *horizon},
-			Logger:       logger,
 		}
 		httpSrv := &http.Server{
 			Addr:              *addr,

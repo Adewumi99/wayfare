@@ -65,6 +65,32 @@ func (c *Client) httpClient() *http.Client {
 	return &http.Client{Timeout: 20 * time.Second}
 }
 
+// ErrRateLimited reports that Horizon refused a request with HTTP 429.
+//
+// It is distinct from a generic failure because the remedy differs, and a
+// caller that cannot tell them apart treats a throttled corridor as a broken
+// one: under a monitoring schedule a 429 is routine and transient — ask again
+// after the interval — while a 500 means the upstream is unhealthy and no
+// interval fixes it. Collapsing the two would make every quota blip read as
+// an outage.
+type ErrRateLimited struct {
+	Endpoint string
+
+	// RetryAfter is what Horizon's Retry-After header asked for. Zero when
+	// the header was absent or unparseable — reported rather than guessed.
+	RetryAfter time.Duration
+}
+
+func (e *ErrRateLimited) Error() string {
+	msg := fmt.Sprintf("dex: horizon rate-limited %s", e.Endpoint)
+	if e.RetryAfter > 0 {
+		msg += fmt.Sprintf("; retry after %s", e.RetryAfter)
+	} else {
+		msg += "; horizon sent no usable Retry-After"
+	}
+	return msg
+}
+
 // Path is one route Horizon found through the DEX.
 type Path struct {
 	SourceAsset  asset.Asset
@@ -243,9 +269,16 @@ func (c *Client) MeasureSlippage(ctx context.Context, source asset.Asset, amount
 	return s, nil
 }
 
-func (c *Client) log() *slog.Logger {
-	if c.Logger != nil {
-		return c.Logger
+// pkgLogger is the package-level logger for upstream call logging.
+// Set via SetLogger; nil means slog.Default().
+var pkgLogger *slog.Logger
+
+// SetLogger configures the package-level logger for upstream call logging.
+func SetLogger(l *slog.Logger) { pkgLogger = l }
+
+func log() *slog.Logger {
+	if pkgLogger != nil {
+		return pkgLogger
 	}
 	return slog.Default()
 }
@@ -265,7 +298,7 @@ func (c *Client) get(ctx context.Context, path string, q url.Values, out any) er
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		c.log().Error("horizon request failed",
+		log().Error("horizon request failed",
 			"service", "horizon",
 			"endpoint", path,
 			"duration", time.Since(started).Round(time.Millisecond).String(),
@@ -275,15 +308,18 @@ func (c *Client) get(ctx context.Context, path string, q url.Values, out any) er
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		c.log().Error("horizon returned error",
+		log().Error("horizon returned error",
 			"service", "horizon",
 			"endpoint", path,
 			"status", resp.StatusCode,
 			"duration", time.Since(started).Round(time.Millisecond).String())
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return &ErrRateLimited{Endpoint: path, RetryAfter: transport.RetryAfter(resp)}
+		}
 		return fmt.Errorf("dex: horizon returned HTTP %d for %s", resp.StatusCode, path)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		c.log().Error("horizon response decode failed",
+		log().Error("horizon response decode failed",
 			"service", "horizon",
 			"endpoint", path,
 			"duration", time.Since(started).Round(time.Millisecond).String(),
@@ -291,7 +327,7 @@ func (c *Client) get(ctx context.Context, path string, q url.Values, out any) er
 		return fmt.Errorf("dex: decoding horizon response: %w", err)
 	}
 
-	c.log().Debug("horizon request succeeded",
+	log().Debug("horizon request succeeded",
 		"service", "horizon",
 		"endpoint", path,
 		"status", resp.StatusCode,
