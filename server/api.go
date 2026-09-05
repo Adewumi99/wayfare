@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -124,7 +125,11 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
 	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, codeMethodNotAllowed, "only GET is supported")
+		writeError(w, r, http.StatusMethodNotAllowed, codeMethodNotAllowed, "only GET is supported")
+		return
+	}
+	if err := checkParams(r, "from", "to", "sizes", "live"); err != nil {
+		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
 		return
 	}
 
@@ -133,14 +138,14 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 
 	sendAsset, ok := asset.Lookup(from)
 	if !ok {
-		writeError(w, http.StatusBadRequest, codeUnknownSendAsset, fmt.Sprintf(
+		writeError(w, r, http.StatusBadRequest, codeUnknownSendAsset, fmt.Sprintf(
 			"unknown send asset %q; verified assets are %s",
 			from, strings.Join(asset.KnownCodes(), ", ")))
 		return
 	}
 	recvAsset, ok := asset.Lookup(to)
 	if !ok {
-		writeError(w, http.StatusBadRequest, codeUnknownReceiveAsset, fmt.Sprintf(
+		writeError(w, r, http.StatusBadRequest, codeUnknownReceiveAsset, fmt.Sprintf(
 			"unknown receive asset %q; verified assets are %s",
 			to, strings.Join(asset.KnownCodes(), ", ")))
 		return
@@ -148,7 +153,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 
 	pegQuote, ok := asset.FiatPeg(recvAsset)
 	if !ok {
-		writeError(w, http.StatusBadRequest, codeNoFiatPeg, fmt.Sprintf(
+		writeError(w, r, http.StatusBadRequest, codeNoFiatPeg, fmt.Sprintf(
 			"no verified fiat peg for %s, so there is no independent rate to score it against",
 			recvAsset.Code))
 		return
@@ -160,7 +165,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 
 	sizes, err := parseSizes(r.URL.Query().Get("sizes"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidSizes, err.Error())
+		writeError(w, r, http.StatusBadRequest, codeInvalidSizes, err.Error())
 		return
 	}
 
@@ -170,7 +175,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 	if s.HistoryFirst && r.URL.Query().Get("live") == "" {
 		if stale, ok := s.staleFor(r.Context(), sendAsset.Code, recvAsset.Code,
 			pegBase+"/"+pegQuote); ok {
-			writeJSON(w, http.StatusOK, stale)
+			writeJSON(w, r, http.StatusOK, stale)
 			log().Info("corridor measured",
 				"method", r.Method,
 				"path", r.URL.Path,
@@ -211,7 +216,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 		// project, by returning a plausible number instead of admitting
 		// it does not currently know.
 		if stale, ok := s.staleFor(ctx, sendAsset.Code, recvAsset.Code, pegBase+"/"+pegQuote); ok {
-			writeJSON(w, http.StatusOK, stale)
+			writeJSON(w, r, http.StatusOK, stale)
 			log().Info("corridor measured",
 				"method", r.Method,
 				"path", r.URL.Path,
@@ -229,7 +234,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusGatewayTimeout
 			code = codeUpstreamTimeout
 		}
-		writeError(w, status, code, "measuring corridor: "+err.Error())
+		writeError(w, r, status, code, "measuring corridor: "+err.Error())
 		return
 	}
 
@@ -242,7 +247,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 		out = route.WithFindings(out, s.Checks.ForAsset(ctx, recvAsset))
 	}
 
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, r, http.StatusOK, out)
 
 	// Request log: corridor, sizes, duration, and status. Upstream attribution
 	// happens inside the engine; this boundary log attributes the overall
@@ -263,21 +268,74 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request) {
+	if err := checkParams(r); err != nil {
+		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
+		return
+	}
 	type entry struct {
 		route.AssetJSON
-		Corridor bool `json:"can_be_destination"`
+		Corridor bool           `json:"can_be_destination"`
+		State    *corridorState `json:"state,omitempty"`
 	}
+
+	// Build a set of corridor keys that have stored history, so we can
+	// annotate each asset in O(1) per lookup. When the store is not
+	// configured, historySet stays nil and state is omitted from every
+	// entry — the UI renders "No measurements yet" rather than a
+	// fabricated false.
+	historySet, storeAvail := (map[string]bool)(nil), false
+	if s.Store != nil {
+		corridors, err := s.Store.Corridors(r.Context())
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, codeInternalError,
+				"listing stored corridors: "+err.Error())
+			return
+		}
+		historySet = make(map[string]bool, len(corridors))
+		for _, c := range corridors {
+			historySet[c] = true
+		}
+		storeAvail = true
+	}
+
 	out := make([]entry, 0)
 	for _, code := range asset.KnownCodes() {
 		a, _ := asset.Lookup(code)
 		_, hasPeg := asset.FiatPeg(a)
-		out = append(out, entry{AssetJSON: route.ToAssetJSON(a), Corridor: hasPeg})
+		e := entry{AssetJSON: route.ToAssetJSON(a), Corridor: hasPeg}
+
+		// For corridor destinations, check whether USDC → CODE has been
+		// priced before. The store key uses the same CorridorKey format
+		// as the monitor and the measurement workflow.
+		if hasPeg && storeAvail {
+			key := runstore.CorridorKey("USDC", code)
+			st := &corridorState{HasHistory: historySet[key]}
+			if st.HasHistory {
+				rec, err := s.Store.Latest(r.Context(), key)
+				if err != nil {
+					writeError(w, r, http.StatusInternalServerError, codeInternalError,
+						fmt.Sprintf("loading history for %s: %v", code, err))
+					return
+				}
+				if rec != nil {
+					st.LastIntegrity = rec.Integrity
+					st.LastMeasured = rec.RecordedAt.UTC().Format(time.RFC3339)
+				}
+			}
+			e.State = st
+		}
+
+		out = append(out, e)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"assets": out})
+	writeJSON(w, r, http.StatusOK, map[string]any{"assets": out})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	if err := checkParams(r); err != nil {
+		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
+		return
+	}
+	writeJSON(w, r, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // helpers --------------------------------------------------------------------
@@ -294,7 +352,44 @@ const (
 	codeInvalidSizes        = "invalid_sizes"
 	codeMeasurementFailed   = "measurement_failed"
 	codeUpstreamTimeout     = "upstream_timeout"
+	codeInvalidQuery        = "invalid_query"
+	codeInternalError       = "internal_error"
 )
+
+// checkParams rejects any query parameter outside the endpoint's allow-list.
+//
+// A typo like ?tp=NGNC used to be silently ignored — the request then
+// measured the default corridor and answered with a confident body that was
+// not what was asked for. Strict handling turns that silent wrong answer
+// into an explicit error, which is the whole point of the API-surface
+// hardening: a client that asks the wrong question is told so, not given a
+// plausible answer to a different question.
+func checkParams(r *http.Request, allowed ...string) error {
+	ok := make(map[string]bool, len(allowed))
+	for _, a := range allowed {
+		ok[a] = true
+	}
+	var unknown []string
+	for k := range r.URL.Query() {
+		if !ok[k] {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	quoted := make([]string, len(unknown))
+	for i, k := range unknown {
+		quoted[i] = fmt.Sprintf("%q", k)
+	}
+	if len(allowed) == 0 {
+		return fmt.Errorf("unknown query parameter(s): %s; this endpoint accepts none",
+			strings.Join(quoted, ", "))
+	}
+	return fmt.Errorf("unknown query parameter(s): %s; supported parameters are %s",
+		strings.Join(quoted, ", "), strings.Join(allowed, ", "))
+}
 
 func param(r *http.Request, key, fallback string) string {
 	if v := strings.TrimSpace(r.URL.Query().Get(key)); v != "" {
@@ -333,16 +428,40 @@ func parseSizes(raw string) ([]decimal.Decimal, error) {
 	return out, nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
+// wantsPretty reports whether the request asked for an indented JSON body
+// via ?pretty=1 (or ?pretty=true, or a bare ?pretty). The default is
+// compact: an indented body roughly doubles the payload for consumers that
+// only parse it, so the readable form is opt-in rather than the price every
+// programmatic caller pays.
+//
+// Presence and value are read separately because a bare ?pretty is a
+// request and an absent parameter is not, and url.Values.Get collapses the
+// two into the same empty string.
+func wantsPretty(r *http.Request) bool {
+	raw, ok := r.URL.Query()["pretty"]
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(raw[0])) {
+	case "", "1", "true":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeJSON(w http.ResponseWriter, r *http.Request, status int, body any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
+	if wantsPretty(r) {
+		enc.SetIndent("", "  ")
+	}
 	_ = enc.Encode(body)
 }
 
-func writeError(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, map[string]string{
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+	writeJSON(w, r, status, map[string]string{
 		"error": msg,
 		"code":  code,
 	})
@@ -417,8 +536,12 @@ func staleJSON(rec *runstore.Record, pair string, now time.Time) route.CorridorJ
 		},
 	}
 
+	// DependsOn entries are stored as codes alone, but an asset code
+	// identifies nothing — the issuer is the identity — so each is resolved
+	// back through the verified registry to carry the same identity the
+	// live document did. See assetFromStoredCode.
 	for _, code := range rec.DependsOn {
-		out.DependsOn = append(out.DependsOn, route.AssetJSON{Code: code})
+		out.DependsOn = append(out.DependsOn, assetFromStoredCode(code))
 	}
 	for _, r := range rec.Rungs {
 		rj := route.RungJSON{
@@ -621,16 +744,29 @@ func severityName(rank int) string {
 	}
 }
 
+// assetFromStoredCode resolves a stored asset code to its verified wire
+// identity, or reports the bare code when the registry does not know it.
+//
+// Backlog #8: a code identifies nothing, and the issuer is the identity, so
+// a document rebuilt from storage must carry the issuer the live one did.
+// Resolving through the registry is reconstruction, not synthesis: a code
+// only reaches DependsOn by being a registered fiat token — classify()
+// counts exactly those — so this recovers the identity that was measured.
+// A code the registry does not know stays a bare code; no issuer is guessed.
+func assetFromStoredCode(code string) route.AssetJSON {
+	if a, ok := asset.Lookup(code); ok {
+		return route.ToAssetJSON(a)
+	}
+	return route.AssetJSON{Code: code}
+}
+
 // assetFromCode splits a stored corridor key like "USDC-NGNC".
 func assetFromCode(corridor string, idx int) route.AssetJSON {
 	parts := strings.SplitN(corridor, "-", 2)
 	if idx >= len(parts) {
 		return route.AssetJSON{}
 	}
-	if a, ok := asset.Lookup(parts[idx]); ok {
-		return route.ToAssetJSON(a)
-	}
-	return route.AssetJSON{Code: parts[idx]}
+	return assetFromStoredCode(parts[idx])
 }
 
 // humanAge renders a duration the way a reader thinks about staleness.

@@ -449,6 +449,25 @@ from any origin (`Access-Control-Allow-Origin: *`), so browser consumers on
 another origin can call it directly. No credentials are ever attached to a
 cross-origin read.
 
+The `sizes` parameter overrides the default ladder (0.1 → 5000 USDC across
+12 rungs). The default sizes and the rationale for each rung are documented
+in **[docs/ladder-sizes.md](docs/ladder-sizes.md)**.
+
+**`/healthz`** answers liveness and data age. `status` is process liveness;
+`data` reports each corridor's newest stored record and its age
+(`recorded_at`, `age_seconds`, `age_human`) — the thing actually at risk on a
+`-history-first` deployment, whose served history is only as fresh as its last
+deploy. `data` is `null` when no history exists to describe: unknown, never a
+fabricated age.
+
+Bodies are compact by default; append `&pretty=1` (or `?pretty` on an
+endpoint with no other parameters) to any of the JSON endpoints to get an
+indented body for a human reader.
+
+Query parameters are strict: a parameter an endpoint does not recognise is a
+`400`, so a typo like `?tp=NGNC` fails loudly instead of silently measuring
+the default corridor.
+
 Beyond the contracts above, one field to know: **`live`** is on every response.
 `false` means the reading came from history because a live measurement failed,
 and `stale` then carries its age. With no stored run, the request errors —
