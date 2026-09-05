@@ -240,14 +240,14 @@ func (s *Server) handleTrend(w http.ResponseWriter, r *http.Request) {
 
 	sendAsset, ok := asset.Lookup(from)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "UNKNOWN_ASSET", fmt.Sprintf(
+		writeError(w, http.StatusBadRequest, "UNKNOWN_SEND_ASSET", fmt.Sprintf(
 			"unknown send asset %q; verified assets are %s",
 			from, strings.Join(asset.KnownCodes(), ", ")))
 		return
 	}
 	recvAsset, ok := asset.Lookup(to)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "UNKNOWN_ASSET", fmt.Sprintf(
+		writeError(w, http.StatusBadRequest, "UNKNOWN_RECEIVE_ASSET", fmt.Sprintf(
 			"unknown receive asset %q; verified assets are %s",
 			to, strings.Join(asset.KnownCodes(), ", ")))
 		return
