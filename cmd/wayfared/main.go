@@ -158,7 +158,18 @@ func main() {
 			Engine:       engine,
 			Store:        store,
 			Timeout:      *timeout,
-			ErrorCode:    func(error) string { return "internal_error" },
+			ErrorCode:    func(err error) string {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return "timeout"
+				}
+				if errors.Is(err, context.Canceled) {
+					return "canceled"
+				}
+				if errors.Is(err, os.ErrNotExist) {
+					return "not_found"
+				}
+				return "internal_error"
+			},
 			HistoryFirst: *histFirst,
 			Checks:       &checks.Runner{HorizonURL: *horizon},
 		}
